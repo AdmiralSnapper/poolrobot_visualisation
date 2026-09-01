@@ -4,6 +4,7 @@ import socket
 import struct
 import cv2
 import numpy as np
+#import open3d as o3d
 import json
 
 MSG_TYPE_IMAGE = 1
@@ -50,7 +51,7 @@ def run_receiver(host='0.0.0.0', port=5000):
                 np_arr = np.frombuffer(payload, dtype=np.uint8)
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if img is not None:
-                    cv2.imshow('Live Stream from ROS2 Robot', img)
+                    cv2.imshow('Livestream from RealSense D435i', img)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
 
