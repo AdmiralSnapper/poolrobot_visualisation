@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Windows 11 receiver: live RGB window + live 3D camera/tag frames (Open3D)."""
+"""
+Windows 11 receiver: live RGB window + live 3D camera/tag frames (Open3D).
+
+Protocol (same framing as the Pi sender):
+    frame = 1 byte type | 4 byte big-endian length | payload
+        type 1 = image (JPEG bytes)
+        type 2 = camera pose (JSON: position, quaternion, frame_id, stamp)
+        type 3 = tag poses (JSON: poses: [{id, position, quaternion}, ...])
+
+Run with Python 3.11:  py -3.11 socket_receiver.py
+"""
 import json
 import socket
 import struct
@@ -20,6 +30,13 @@ CAMERA_FRAME_SIZE = 0.25
 TAG_FRAME_SIZE = 0.15
 TRAIL_LENGTH = 500
 
+# --- physical tag sizes (metres) ---
+TAG_SIZE_DEFAULT = 0.223
+TAG_SIZES = {
+    # per-id override if your tags differ in size, e.g.:
+    # 0: 0.1175, 1: 0.0840, 2: 0.04187
+}
+
 
 def inv_transform(T):
     """Closed-form inverse of a 4x4 homogeneous transform."""
@@ -29,32 +46,57 @@ def inv_transform(T):
     return Tinv
 
 
+def _make_tag_square(size):
+    """Flat white tag face with black border, lying in the XY plane."""
+    s = size / 2.0
+
+    square = o3d.geometry.TriangleMesh.create_box(
+        width=size, height=size, depth=0.0015)
+    square.translate([-s, -s, -0.00075])       # center on the tag origin
+    square.paint_uniform_color([0.95, 0.95, 0.95])
+
+    pts = [[-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0]]
+    border = o3d.geometry.LineSet()
+    border.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=float))
+    border.lines = o3d.utility.Vector2iVector(
+        np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32))
+    border.colors = o3d.utility.Vector3dVector(
+        np.tile([0.0, 0.0, 0.0], (4, 1)))
+    return square, border
+
+
 class LiveViewer:
     def __init__(self):
         # --- Open3D scene ---
         self.vis = o3d.visualization.Visualizer()
         self.vis.create_window(window_name='Live 3D Frames', width=1024, height=768)
 
-        # 1. Camera Frame (matches tag size)
+        # Camera frame is created lazily on the first valid pose
         self.cam_geom = None
         self.cam_T = np.eye(4)
 
-        # 2. Tag frames & path trail
-        self.tag_frames = {}          # id -> [geometry, current_T]
+        # Tag frames: id -> [frame_geometry, current_T]
+        self.tag_frames = {}
+        # Tag squares: id -> [square_mesh, border_lines, current_T]
+        self.tag_squares = {}
+        # Previous tag pose snapshot for change detection
+        self._last_tag_poses = None
+
+        # Camera trail
         self.path_points = deque(maxlen=TRAIL_LENGTH)
         self.path_line = None
         self.path_added = False
 
-    # ---------- geometry updates ----------
     def _set_pose(self, geom, T_new, T_old):
-        """Update geometry to T_new without accumulation errors."""
-        geom.transform(T_new @ inv_transform(T_old))
+        """Update geometry in place from old transform to new."""
+        delta = T_new @ inv_transform(T_old)
+        geom.transform(delta)
         self.vis.update_geometry(geom)
 
     def set_camera_pose(self, pos, quat):
         pos_arr = np.asarray(pos, dtype=float)
 
-        # Ignore lost detection / zero fallback poses
+        # Ignore lost-detection / zero fallback poses
         if np.allclose(pos_arr, [0.0, 0.0, 0.0]):
             return
 
@@ -94,98 +136,126 @@ class LiveViewer:
             self.path_line.colors = o3d.utility.Vector3dVector(colors)
             self.vis.update_geometry(self.path_line)
 
-
     def set_tag_pose(self, tag_id, pos, quat, rel_to_camera=True):
         T_rel = np.eye(4)
         T_rel[:3, :3] = Rotation.from_quat(quat).as_matrix()
         T_rel[:3, 3] = np.asarray(pos, dtype=float)
         T_world = self.cam_T @ T_rel if rel_to_camera else T_rel
 
+        # --- coordinate frame ---
         entry = self.tag_frames.get(tag_id)
         if entry is None:
             geom = o3d.geometry.TriangleMesh.create_coordinate_frame(
                 size=TAG_FRAME_SIZE)
-            geom.transform(T_world)          # set pose BEFORE adding
-            self.vis.add_geometry(geom)      # renderer picks it up on next pump
+            geom.transform(T_world)
+            self.vis.add_geometry(geom)
             self.tag_frames[tag_id] = [geom, T_world]
         else:
             geom, T_old = entry
-            geom.transform(T_world @ inv_transform(T_old))
-            self.vis.update_geometry(geom)   # only for already-visible geoms
+            self._set_pose(geom, T_world, T_old)
             entry[1] = T_world
 
+        # --- physical square ---
+        size = TAG_SIZES.get(tag_id, TAG_SIZE_DEFAULT)
+        entry_sq = self.tag_squares.get(tag_id)
+        if entry_sq is None:
+            square, border = _make_tag_square(size)
+            square.transform(T_world)
+            border.transform(T_world)
+            self.vis.add_geometry(square)
+            self.vis.add_geometry(border)
+            self.tag_squares[tag_id] = [square, border, T_world]
+        else:
+            square, border, T_old = entry_sq
+            delta = T_world @ inv_transform(T_old)
+            square.transform(delta)
+            border.transform(delta)
+            self.vis.update_geometry(square)
+            self.vis.update_geometry(border)
+            entry_sq[2] = T_world
 
-    # ---------- message handling ----------
     def handle(self, msg_type, payload):
         if msg_type == MSG_TYPE_IMAGE:
-            img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-            if img is not None:
-                cv2.imshow('Live RGB', img)
+            frame = cv2.imdecode(
+                np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                cv2.imshow('Camera Feed', frame)
+                cv2.waitKey(1)
+
         elif msg_type == MSG_TYPE_CAMERA_POSE:
             data = json.loads(payload)
             self.set_camera_pose(data['position'], data['quaternion'])
+
         elif msg_type == MSG_TYPE_TAG_POSES:
             data = json.loads(payload)
+
+            # Skip if identical to the previous message
+            snapshot = tuple(
+                (p['id'], tuple(p['position']), tuple(p['quaternion']))
+                for p in data['poses']
+            )
+            if snapshot == self._last_tag_poses:
+                return
+
+            self._last_tag_poses = snapshot
+
             for p in data['poses']:
                 self.set_tag_pose(p['id'], p['position'], p['quaternion'])
 
-    def pump(self):
-        self.vis.poll_events()
-        self.vis.update_renderer()
-        cv2.waitKey(1)
+    def run(self):
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((HOST, PORT))
+        server_sock.listen(1)
 
-    def close(self):
-        self.vis.destroy_window()
-        cv2.destroyAllWindows()
+        print(f'Listening on port {PORT}. Waiting for the ROS node to connect...')
+        conn, addr = server_sock.accept()
+        print(f'Connected: {addr}')
 
+        cv2.namedWindow('Camera Feed', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Camera Feed', 1280, 960)
+        conn.settimeout(0.05)
 
-def recvall(conn, n):
-    data = b''
-    while len(data) < n:
-        chunk = conn.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError('connection closed')
-        data += chunk
-    return data
+        data_buffer = b''
+        header_size = 5  # 1 byte type + 4 byte length
 
-
-def main():
-    viewer = LiveViewer()
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(1)
-    print(f'Listening on port {PORT}...')
-    conn, addr = server.accept()
-    conn.settimeout(0.1)
-    print(f'Connected: {addr}')
-
-    buf = b''
-    try:
-        while True:
-            try:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    print('Connection lost.')
+        try:
+            while True:
+                # Pump the Open3D viewer every iteration
+                if not self.vis.poll_events():
+                    print('3D window closed.')
                     break
-                buf += chunk
-                while len(buf) >= 5:
-                    msg_type, length = struct.unpack('>BI', buf[:5])
-                    if len(buf) < 5 + length:
-                        break
-                    payload = buf[5:5 + length]
-                    buf = buf[5 + length:]
-                    viewer.handle(msg_type, payload)
-            except socket.timeout:
-                pass
-            viewer.pump()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        conn.close()
-        server.close()
-        viewer.close()
+                self.vis.update_renderer()
+
+                try:
+                    chunk = conn.recv(65536)
+                except socket.timeout:
+                    continue          # no data this tick; keep rendering
+                if not chunk:
+                    print('Connection closed by sender.')
+                    break
+                data_buffer += chunk
+
+                while len(data_buffer) >= header_size:
+                    msg_type = data_buffer[0]
+                    (length,) = struct.unpack('>I', data_buffer[1:5])
+
+                    if len(data_buffer) < header_size + length:
+                        break  # wait for the full payload
+
+                    payload = data_buffer[header_size:header_size + length]
+                    data_buffer = data_buffer[header_size + length:]
+
+                    self.handle(msg_type, payload)
+        except KeyboardInterrupt:
+            print('\nStopped by user.')
+        except Exception as e:
+            print(f'Error: {e}')
+        finally:
+            conn.close()
+            server_sock.close()
+            cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
-    main()
+    LiveViewer().run()
